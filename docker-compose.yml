@@ -1,0 +1,30 @@
+services:
+  qwen3-tts-openai:
+    build: .
+    image: qwen3-tts-openai:local
+    container_name: qwen3-tts-openai
+    ports:
+      - "8000:8000"
+    environment:
+      # Required if model snapshots need auth:
+      - HF_TOKEN=${HF_TOKEN}
+      # Enforce GPU-only:
+      - REQUIRE_CUDA=1
+      # Optional: reduce HF cache redownloads by mounting a volume below
+      - HF_HOME=/data/hf
+      - TRANSFORMERS_CACHE=/data/hf/transformers
+      - HF_HUB_CACHE=/data/hf/hub
+    volumes:
+      - hf-cache:/data/hf
+    # Docker Compose v2 GPU support:
+    # gpus: all
+    # OR: GPU device mapping (NixOS compatible):
+    devices:
+      - /dev/nvidia0:/dev/nvidia0
+      - /dev/nvidiactl:/dev/nvidiactl
+      - /dev/nvidia-uvm:/dev/nvidia-uvm
+      - /dev/nvidia-uvm-tools:/dev/nvidia-uvm-tools
+    restart: unless-stopped
+
+volumes:
+  hf-cache:
