@@ -31,19 +31,23 @@ Example
 
 from __future__ import annotations
 
+import base64
 import io
 import os
 import time
 import logging
 from dataclasses import dataclass
-from typing import Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import numpy as np
 import soundfile as sf
-from fastapi import FastAPI, HTTPException
+import torch
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response
 from huggingface_hub import snapshot_download
 from pydub import AudioSegment
+from safetensors.torch import load as load_safetensors
+from starlette.datastructures import UploadFile as StarletteUploadFile
 
 # Optional: authenticate to HF if token is present
 try:
@@ -149,7 +153,6 @@ def get_model(model_type: str, model_size: str):
 
     # GPU-only by default (since CPU inference will be extremely slow).
     # Set REQUIRE_CUDA=0 to allow CPU fallback (not recommended).
-    import torch
 
     require_cuda = os.environ.get("REQUIRE_CUDA", "1").strip() not in ("0", "false", "False")
     if require_cuda and not torch.cuda.is_available():
@@ -243,8 +246,68 @@ def _wav_bytes(audio: np.ndarray, sr: int, subtype: str = "PCM_16") -> bytes:
     return buf.getvalue()
 
 
+def _load_embedding_from_safetensors_bytes(raw: bytes) -> torch.Tensor:
+    tensors = load_safetensors(raw)
+    if "speaker_embedding" in tensors:
+        embedding = tensors["speaker_embedding"]
+    elif len(tensors) == 1:
+        # Fallback: accept single-tensor safetensors payloads.
+        embedding = next(iter(tensors.values()))
+    else:
+        raise HTTPException(
+            400,
+            "safetensors payload must contain 'speaker_embedding' or exactly one tensor",
+        )
+
+    if not isinstance(embedding, torch.Tensor):
+        raise HTTPException(400, "Loaded speaker embedding is not a tensor")
+
+    embedding = embedding.detach().to(dtype=torch.float32).flatten().cpu()
+    if embedding.numel() != 2048:
+        raise HTTPException(400, f"voice_embedding must have exactly 2048 dimensions, got {tuple(embedding.shape)}")
+    return embedding.reshape(2048)
+
+
+def _decode_voice_embedding(voice_embedding: Any) -> torch.Tensor:
+    if isinstance(voice_embedding, list):
+        embedding = torch.tensor(voice_embedding, dtype=torch.float32).flatten()
+        if embedding.numel() != 2048:
+            raise HTTPException(400, f"voice_embedding must have exactly 2048 dimensions, got {tuple(embedding.shape)}")
+        return embedding.reshape(2048)
+
+    if isinstance(voice_embedding, StarletteUploadFile) or (
+        hasattr(voice_embedding, "read") and hasattr(voice_embedding, "filename")
+    ):
+        raise HTTPException(400, "Internal error: file uploads must be read before decoding")
+
+    if isinstance(voice_embedding, (bytes, bytearray)):
+        return _load_embedding_from_safetensors_bytes(bytes(voice_embedding))
+
+    if isinstance(voice_embedding, str):
+        # Base64 string can contain either safetensors bytes or raw float32 bytes.
+        try:
+            raw = base64.b64decode(voice_embedding, validate=True)
+        except Exception as e:
+            raise HTTPException(400, f"voice_embedding base64 decode failed: {type(e).__name__}: {e}")
+
+        try:
+            return _load_embedding_from_safetensors_bytes(raw)
+        except HTTPException:
+            # Fallback for existing clients sending raw float32 bytes.
+            embedding = torch.frombuffer(bytearray(raw), dtype=torch.float32).clone().flatten()
+            if embedding.numel() != 2048:
+                raise HTTPException(
+                    400,
+                    "voice_embedding must decode to safetensors with 'speaker_embedding' "
+                    "or raw float32 bytes with exactly 2048 values",
+                )
+            return embedding.reshape(2048)
+
+    raise HTTPException(400, "voice_embedding must be a list, a base64 string, or a .safetensors file upload")
+
+
 @app.post("/v1/audio/speech")
-def audio_speech(payload: Dict):
+async def audio_speech(request: Request):
     """OpenAI-compatible TTS endpoint.
 
     Expected JSON body fields (subset):
@@ -253,15 +316,36 @@ def audio_speech(payload: Dict):
       - voice: str (required for CustomVoice; mapped to speaker)
       - response_format: "wav" (default), "pcm" (16-bit little-endian), or "mp3"
       - speed: ignored for now
+      - voice_embedding: list[float], base64 string, or .safetensors file upload (optional, base model only)
+            A 2048-dim speaker embedding. When provided with the base model,
+            uses x-vector-only voice cloning (no reference audio needed).
 
     For Qwen3-TTS mapping:
       - CustomVoice -> speaker = voice
       - VoiceDesign -> instruct = voice (treat voice string as description)
+      - Base + voice_embedding -> x-vector-only voice clone
     """
+
+    content_type = (request.headers.get("content-type") or "").lower()
+    payload: Dict[str, Any]
+
+    if "multipart/form-data" in content_type:
+        form = await request.form()
+        payload = {k: v for k, v in form.items() if k != "voice_embedding"}
+        voice_embedding_upload = form.get("voice_embedding")
+        if isinstance(voice_embedding_upload, StarletteUploadFile) or (
+            hasattr(voice_embedding_upload, "read") and hasattr(voice_embedding_upload, "filename")
+        ):
+            payload["voice_embedding"] = await voice_embedding_upload.read()
+        elif voice_embedding_upload is not None:
+            payload["voice_embedding"] = voice_embedding_upload
+    else:
+        payload = await request.json()
 
     model = payload.get("model")
     text = payload.get("input")
     voice = payload.get("voice")
+    voice_embedding = payload.get("voice_embedding")
     response_format = (payload.get("response_format") or "wav").lower()
 
     if not model:
@@ -295,12 +379,35 @@ def audio_speech(payload: Dict):
                 non_streaming_mode=True,
                 max_new_tokens=int(payload.get("max_new_tokens") or 2048),
             )
-        else:
-            raise HTTPException(
-                400,
-                "The 'base' (voice clone) model is not exposed via /v1/audio/speech in this minimal server. "
-                "Use customvoice or voicedesign.",
+        elif resolved.model_type == "Base":
+            if not voice_embedding:
+                raise HTTPException(
+                    400,
+                    "voice_embedding is required for the base model. "
+                    "Provide a 2048-dim speaker embedding as list/base64 or upload a .safetensors file "
+                    "in the voice_embedding field.",
+                )
+
+            embedding_tensor = _decode_voice_embedding(voice_embedding)
+
+            from qwen_tts.inference.qwen3_tts_model import VoiceClonePromptItem
+
+            prompt = VoiceClonePromptItem(
+                ref_code=None,
+                ref_spk_embedding=embedding_tensor,
+                x_vector_only_mode=True,
+                icl_mode=False,
             )
+
+            wavs, sr = tts.generate_voice_clone(
+                text=str(text).strip(),
+                language=payload.get("language") or "Auto",
+                voice_clone_prompt=[prompt],
+                non_streaming_mode=True,
+                max_new_tokens=int(payload.get("max_new_tokens") or 2048),
+            )
+        else:
+            raise HTTPException(400, f"Unsupported model type: {resolved.model_type}")
 
         audio = wavs[0]
         audio = np.asarray(audio, dtype=np.float32)
