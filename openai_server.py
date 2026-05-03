@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import base64
 import io
+import json
 import os
 import time
 import logging
@@ -140,6 +141,28 @@ def _snapshot_download_with_logs(repo_id: str) -> str:
     return path
 
 
+def _voices_from_snapshot_config(repo_id: str) -> Optional[List[str]]:
+    """Read CustomVoice speaker ids from cached config.json without loading the model.
+
+    Loading the 1.7B model just to list voices can exhaust 4 GB GPUs. The
+    speaker map is already present in the HF snapshot config under
+    talker_config.spk_id, so /v1/voices can stay lightweight.
+    """
+    try:
+        snapshot_path = _snapshot_download_with_logs(repo_id)
+        config_path = os.path.join(snapshot_path, "config.json")
+        with open(config_path, "r", encoding="utf-8") as f:
+            config = json.load(f)
+        spk_id = (config.get("talker_config") or {}).get("spk_id")
+        if isinstance(spk_id, dict):
+            return [str(k) for k in spk_id.keys()]
+        if isinstance(spk_id, list):
+            return [str(k) for k in spk_id]
+    except Exception as e:
+        logger.warning("Failed to read voices from %s config: %s: %s", repo_id, type(e).__name__, e)
+    return None
+
+
 def get_model(model_type: str, model_size: str):
     """Load and cache the underlying Qwen3TTSModel."""
     key = (model_type, model_size)
@@ -161,15 +184,35 @@ def get_model(model_type: str, model_size: str):
             "Make sure you run the container with NVIDIA runtime (e.g. --gpus all) and that CUDA is working."
         )
 
-    device_map = "cuda" if torch.cuda.is_available() else "cpu"
-    dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+    device_map = os.environ.get("QWEN3_TTS_DEVICE_MAP")
+    if not device_map:
+        # `auto` allows CPU offload on small GPUs while still using CUDA.
+        device_map = "auto" if torch.cuda.is_available() else "cpu"
 
-    tts = Qwen3TTSModel.from_pretrained(
-        model_path,
+    dtype_name = os.environ.get("QWEN3_TTS_DTYPE")
+    if not dtype_name:
+        # GTX 1050 Ti-class GPUs do not support bfloat16 well; float16 is
+        # smaller than float32 and avoids the earlier bfloat16 default.
+        dtype_name = "float16" if torch.cuda.is_available() else "float32"
+    dtype = getattr(torch, dtype_name)
+
+    load_kwargs = dict(
         device_map=device_map,
         dtype=dtype,
         token=os.environ.get("HF_TOKEN"),
     )
+    if device_map == "auto" and torch.cuda.is_available():
+        load_kwargs["max_memory"] = {
+            0: os.environ.get("QWEN3_TTS_MAX_GPU_MEMORY", "3400MiB"),
+            "cpu": os.environ.get("QWEN3_TTS_MAX_CPU_MEMORY", "48GiB"),
+        }
+        offload_folder = os.environ.get("QWEN3_TTS_OFFLOAD_FOLDER", "/data/hermes/twelvereader/qwen3-tts-offload")
+        os.makedirs(offload_folder, exist_ok=True)
+        load_kwargs["offload_folder"] = offload_folder
+        load_kwargs["low_cpu_mem_usage"] = True
+
+    logger.info("Loading model %s with device_map=%s dtype=%s", hf_repo, device_map, dtype_name)
+    tts = Qwen3TTSModel.from_pretrained(model_path, **load_kwargs)
 
     _loaded_models[key] = tts
     return tts
@@ -211,9 +254,11 @@ def list_voices(model: str = "qwen3-tts-customvoice-1.7b"):
     """
     try:
         resolved = resolve_model(model)
-        tts = get_model(resolved.model_type, resolved.model_size)
-        speakers = tts.get_supported_speakers()
-        
+        if resolved.model_type == "CustomVoice":
+            speakers = _voices_from_snapshot_config(resolved.hf_repo)
+        else:
+            speakers = None
+
         if speakers is None:
             # Model doesn't provide a speakers list (e.g., VoiceDesign or Base models)
             return {"object": "list", "data": [], "note": f"Model {model} accepts any voice description"}
