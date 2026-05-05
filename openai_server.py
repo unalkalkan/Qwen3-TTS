@@ -32,9 +32,11 @@ Example
 from __future__ import annotations
 
 import base64
+import gc
 import io
 import json
 import os
+import threading
 import time
 import logging
 from dataclasses import dataclass
@@ -122,6 +124,85 @@ def resolve_model(model: str) -> ResolvedModel:
 
 
 _loaded_models: Dict[Tuple[str, str], "Qwen3TTSModel"] = {}
+_last_model_access_at: Dict[Tuple[str, str], float] = {}
+_model_lock = threading.RLock()
+_idle_watcher_started = False
+
+
+def get_idle_unload_seconds() -> int:
+    raw = os.environ.get("QWEN3_TTS_IDLE_UNLOAD_SECONDS", "180").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("Invalid QWEN3_TTS_IDLE_UNLOAD_SECONDS=%r; using 180", raw)
+        return 180
+    return max(0, value)
+
+
+def _mark_model_used(key: Tuple[str, str], now: Optional[float] = None) -> None:
+    _last_model_access_at[key] = time.time() if now is None else now
+
+
+def _delete_model_references(model: Any) -> None:
+    # Qwen3TTSModel keeps the heavy modules under .model/.processor. Clearing
+    # those references before deleting the wrapper helps Python release CUDA
+    # tensors promptly even if the wrapper had cyclic refs.
+    for attr in ("model", "processor"):
+        try:
+            setattr(model, attr, None)
+        except Exception:
+            pass
+
+
+def unload_idle_models(now: Optional[float] = None) -> List[Tuple[str, str]]:
+    idle_seconds = get_idle_unload_seconds()
+    if idle_seconds <= 0:
+        return []
+
+    now = time.time() if now is None else now
+    unloaded: List[Tuple[str, str]] = []
+    with _model_lock:
+        for key, model in list(_loaded_models.items()):
+            last_used = _last_model_access_at.get(key, now)
+            if now - last_used < idle_seconds:
+                continue
+            _loaded_models.pop(key, None)
+            _last_model_access_at.pop(key, None)
+            _delete_model_references(model)
+            del model
+            unloaded.append(key)
+
+    if unloaded:
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            try:
+                torch.cuda.ipc_collect()
+            except Exception:
+                pass
+        logger.info("Unloaded idle Qwen3-TTS models after %ss idle: %s", idle_seconds, unloaded)
+    return unloaded
+
+
+def _idle_unload_loop() -> None:
+    while True:
+        idle_seconds = get_idle_unload_seconds()
+        sleep_seconds = 30 if idle_seconds <= 0 else max(1, min(30, idle_seconds))
+        time.sleep(sleep_seconds)
+        try:
+            unload_idle_models()
+        except Exception:
+            logger.exception("Idle model unload check failed")
+
+
+def start_idle_unload_watcher() -> None:
+    global _idle_watcher_started
+    if _idle_watcher_started or get_idle_unload_seconds() <= 0:
+        return
+    _idle_watcher_started = True
+    thread = threading.Thread(target=_idle_unload_loop, name="qwen3-tts-idle-unloader", daemon=True)
+    thread.start()
+    logger.info("Qwen3-TTS idle model unload enabled: %ss", get_idle_unload_seconds())
 
 
 def _snapshot_download_with_logs(repo_id: str) -> str:
@@ -163,12 +244,7 @@ def _voices_from_snapshot_config(repo_id: str) -> Optional[List[str]]:
     return None
 
 
-def get_model(model_type: str, model_size: str):
-    """Load and cache the underlying Qwen3TTSModel."""
-    key = (model_type, model_size)
-    if key in _loaded_models:
-        return _loaded_models[key]
-
+def _load_model(model_type: str, model_size: str):
     from qwen_tts import Qwen3TTSModel
 
     hf_repo = f"Qwen/Qwen3-TTS-12Hz-{model_size}-{model_type}"
@@ -176,7 +252,6 @@ def get_model(model_type: str, model_size: str):
 
     # GPU-only by default (since CPU inference will be extremely slow).
     # Set REQUIRE_CUDA=0 to allow CPU fallback (not recommended).
-
     require_cuda = os.environ.get("REQUIRE_CUDA", "1").strip() not in ("0", "false", "False")
     if require_cuda and not torch.cuda.is_available():
         raise RuntimeError(
@@ -212,15 +287,28 @@ def get_model(model_type: str, model_size: str):
         load_kwargs["low_cpu_mem_usage"] = True
 
     logger.info("Loading model %s with device_map=%s dtype=%s", hf_repo, device_map, dtype_name)
-    tts = Qwen3TTSModel.from_pretrained(model_path, **load_kwargs)
+    return Qwen3TTSModel.from_pretrained(model_path, **load_kwargs)
 
-    _loaded_models[key] = tts
-    return tts
+
+def get_model(model_type: str, model_size: str):
+    """Load and cache the underlying Qwen3TTSModel, reloading after idle unload."""
+    key = (model_type, model_size)
+    with _model_lock:
+        tts = _loaded_models.get(key)
+        if tts is not None:
+            _mark_model_used(key)
+            return tts
+
+        tts = _load_model(model_type, model_size)
+        _loaded_models[key] = tts
+        _mark_model_used(key)
+        return tts
 
 
 # ---- OpenAI-compatible API -------------------------------------------------
 
 app = FastAPI(title="Qwen3-TTS OpenAI-Compatible Server", version="0.1.0")
+start_idle_unload_watcher()
 
 
 @app.get("/v1/models")
