@@ -119,3 +119,9 @@ python sft_12hz.py \
   --num_epochs ${EPOCHS} \
   --speaker_name ${SPEAKER_NAME}
 ```
+
+---
+
+## TwelveReader SaaS Context
+
+This repository is used as a TTS submodule by TwelveReader. TwelveReader is moving toward a hosted SaaS plus self-hosted AI audiobook platform. The SaaS roadmap depends on reliable TTS worker behavior, incremental/lazy synthesis, per-user quota accounting for synthesis minutes, language/voice metadata, user voice catalogs, and production-safe retry/recovery semantics. Keep TwelveReader integration compatibility in mind when changing model serving, synthesis outputs, voice metadata, or packaging assumptions.
