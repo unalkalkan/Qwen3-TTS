@@ -545,6 +545,17 @@ async def audio_speech(request: Request):
         audio = wavs[0]
         audio = np.asarray(audio, dtype=np.float32)
 
+        # Release transient CUDA tensors between single-item requests. On 4 GB
+        # cards the model fits, but generation/decode scratch allocations can
+        # leave enough reserved memory to make subsequent segments fail.
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            try:
+                torch.cuda.ipc_collect()
+            except Exception:
+                pass
+
         if response_format == "wav":
             data = _wav_bytes(audio, sr)
             return Response(content=data, media_type="audio/wav")
